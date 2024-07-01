@@ -52,6 +52,7 @@ export interface PageSnapshot {
     screenshot?: Buffer;
     imgs?: ImgBrief[];
     pdfs?: string[];
+    maxElemDepth?: number;
 }
 
 export interface ExtendedSnapshot extends PageSnapshot {
@@ -235,6 +236,32 @@ function briefPDFs() {
         return x.src === 'about:blank' ? document.location.href : x.src;
     });
 }
+function getMaxDepthUsingTreeWalker(root) {
+  let maxDepth = 0;
+  let currentDepth = 0;
+
+  const treeWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
+
+  while (true) {
+    maxDepth = Math.max(maxDepth, currentDepth);
+
+    if (treeWalker.firstChild()) {
+      currentDepth++;
+    } else {
+      while (!treeWalker.nextSibling() && currentDepth > 0) {
+        treeWalker.parentNode();
+        currentDepth--;
+      }
+
+      if (currentDepth <= 0) {
+        break;
+      }
+    }
+  }
+
+  return maxDepth + 1;
+}
+
 function giveSnapshot(stopActiveSnapshot) {
     if (stopActiveSnapshot) {
         window.haltSnapshot = true;
@@ -254,6 +281,7 @@ function giveSnapshot(stopActiveSnapshot) {
         parsed: parsed,
         imgs: [],
         pdfs: briefPDFs(),
+        maxElemDepth: getMaxDepthUsingTreeWalker(document.documentElement)
     };
     if (parsed && parsed.content) {
         const elem = document.createElement('div');
@@ -277,9 +305,15 @@ function giveSnapshot(stopActiveSnapshot) {
 
         const domainSet = new Set<string>();
         let reqCounter = 0;
+        let t0: number | undefined;
+        let halt = false;
 
         page.on('request', (req) => {
             reqCounter++;
+            if (halt) {
+                return req.abort('blockedbyclient', 1000);
+            }
+            t0 ??= Date.now();
             const requestUrl = req.url();
             if (!requestUrl.startsWith("http:") && !requestUrl.startsWith("https:") && requestUrl !== 'about:blank') {
                 return req.abort('blockedbyclient', 1000);
@@ -291,7 +325,6 @@ function giveSnapshot(stopActiveSnapshot) {
 
             if (this.circuitBreakerHosts.has(parsedUrl.hostname.toLowerCase())) {
                 page.emit('abuse', { url: requestUrl, page, sn, reason: `Abusive request: ${requestUrl}` });
-
                 return req.abort('blockedbyclient', 1000);
             }
 
@@ -304,14 +337,22 @@ function giveSnapshot(stopActiveSnapshot) {
                 return req.abort('blockedbyclient', 1000);
             }
 
-            if (reqCounter > 2000) {
-                page.emit('abuse', { url: requestUrl, page, sn, reason: `DDoS attack suspected: Too many requests: ${reqCounter}` });
+            const dt = Math.ceil((Date.now() - t0) / 1000);
+            const rps = reqCounter / dt;
+            // console.log(`rps: ${rps}`);
 
-                return req.abort('blockedbyclient', 1000);
+            if (reqCounter > 1000) {
+                if (rps > 60 || reqCounter > 2000) {
+                    page.emit('abuse', { url: requestUrl, page, sn, reason: `DDoS attack suspected: Too many requests` });
+                    halt = true;
+
+                    return req.abort('blockedbyclient', 1000);
+                }
             }
 
             if (domainSet.size > 200) {
-                page.emit('abuse', { url: requestUrl, page, sn, reason: `DDoS attack suspected: Too many domains (${domainSet.size})` });
+                page.emit('abuse', { url: requestUrl, page, sn, reason: `DDoS attack suspected: Too many domains` });
+                halt = true;
 
                 return req.abort('blockedbyclient', 1000);
             }
@@ -329,7 +370,7 @@ const handlePageLoad = () => {
     if (window.haltSnapshot) {
         return;
     }
-    if (document.readyState !== 'complete') {
+    if (document.readyState === 'loading') {
         return;
     }
     const thisTextLength = (document.body.innerText || '').length;
@@ -434,6 +475,10 @@ document.addEventListener('load', handlePageLoad);
             if (snapshot === s) {
                 return;
             }
+            if (s?.maxElemDepth && s.maxElemDepth > 256) {
+                page.emit('abuse', { url, page, sn, reason: `DoS attack suspected: DOM tree too deep` });
+                return;
+            }
             snapshot = s;
             nextSnapshotDeferred.resolve(s);
             nextSnapshotDeferred = Defer();
@@ -503,7 +548,8 @@ document.addEventListener('load', handlePageLoad);
                 if (options?.minIntervalMs) {
                     ckpt.push(delay(options.minIntervalMs));
                 }
-                await Promise.race(ckpt);
+                let error;
+                await Promise.race(ckpt).catch((err) => error = err);
                 if (finalized) {
                     yield { ...snapshot, screenshot } as PageSnapshot;
                     break;
@@ -514,6 +560,9 @@ document.addEventListener('load', handlePageLoad);
                 }
                 if (snapshot || screenshot) {
                     yield { ...snapshot, screenshot } as PageSnapshot;
+                }
+                if (error) {
+                    throw error;
                 }
             }
         } finally {
